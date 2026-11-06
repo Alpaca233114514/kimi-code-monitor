@@ -8,9 +8,13 @@ import math
 import os
 import re
 import sys
+import time
 import unicodedata
 
 MAX_TAIL_BYTES = 512 * 1024
+MAX_TASK_FILES = 512
+MAX_TASK_BYTES = 64 * 1024
+TASK_SCAN_SECONDS = 0.05
 ANSI = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]')
 
 
@@ -102,6 +106,12 @@ def render(payload, activity=None, width=120, color=True, details=False):
         return paint(tone, bar) + paint('38;2;100;117;139', '░' * (size - filled - bool(fraction))) + ' ' + paint(muted, label + '%')
 
     context = paint(muted, 'Ctx ') + meter(pct, 4 if width < 60 else 6 if width < 100 else 10)
+    tasks = a.get('backgroundTasks') or {}
+    running = tasks.get('running', 0)
+    background = ''
+    if running or tasks.get('incomplete'):
+        count = str(running) + ('+' if tasks.get('incomplete') else '') if running else '?'
+        background = paint('38;2;239;194;111', ('后台 ' if width < 80 else '后台运行 ') + count)
     quota = a.get('quota') or {}
     items = []
     for key, label in [('fiveHour', '5h'), ('week', '周')]:
@@ -114,11 +124,12 @@ def render(payload, activity=None, width=120, color=True, details=False):
         meter(None, 3 if width < 80 else 4) + ' ' + paint('38;2;239;194;111' if quota.get('authRequired') else muted, '需登录' if quota.get('authRequired') else '暂无' if width < 100 else '额度暂无'))
     if width < 60:
         quota_text = paint(muted, 'Kimi ') + (meter((quota.get('fiveHour') or quota.get('week') or {}).get('percent'), 3))
-    if cell_width(context) + len(sep) + cell_width(quota_text) > width:
-        return paint(muted, 'Ctx ') + meter(pct, 4)
+    priority = sep.join([context, background] if background else [context])
+    if cell_width(priority) + len(sep) + cell_width(quota_text) > width:
+        return priority if cell_width(priority) <= width else background or context
     # 先为右侧额度留位，再填中间信息。 / Reserve the right quota before fitting middle groups.
     left_width = width - cell_width(quota_text) - len(sep)
-    parts = [context]
+    parts = [context, background] if background else [context]
 
     def add(value):
         if cell_width(value) == 0:
@@ -128,7 +139,7 @@ def render(payload, activity=None, width=120, color=True, details=False):
 
     effort = clean(p.get('thinkingEffort') or a.get('thinkingEffort'), 12) or '--'
     thinking = paint(muted, '思考 ' + effort)
-    model_width = min(26, left_width - cell_width(context) - cell_width(thinking) - len(sep) * 2)
+    model_width = min(26, left_width - cell_width(sep.join(parts)) - cell_width(thinking) - len(sep) * 2)
     if model_width >= 6:
         add(paint('1;38;2;132;210;255', shorten(p.get('model') or 'Kimi', model_width)))
     add(thinking)
@@ -233,6 +244,64 @@ def parse_activity(text):
     return result
 
 
+def read_background_tasks(session_dir):
+    """任务快照不受日志截尾影响。 / Task snapshots survive wire truncation and turn completion."""
+    running, incomplete, scanned = 0, False, 0
+    deadline = time.monotonic() + TASK_SCAN_SECONDS
+    seen = set()
+
+    def scan(directory, owner):
+        nonlocal running, incomplete, scanned
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if time.monotonic() >= deadline or scanned >= MAX_TASK_FILES:
+                        return False
+                    if not entry.name.endswith('.json') or not entry.is_file(follow_symlinks=False):
+                        continue
+                    key = (owner, entry.name)
+                    if key in seen:
+                        continue
+                    # 新位置优先，避免旧目录重复计数。 / Prefer the current path over legacy duplicates.
+                    seen.add(key)
+                    scanned += 1
+                    try:
+                        with open(entry.path, 'rb') as f:
+                            raw = f.read(MAX_TASK_BYTES + 1)
+                        if len(raw) > MAX_TASK_BYTES:
+                            incomplete = True
+                            continue
+                        task = json.loads(raw)
+                        if not isinstance(task, dict) or not isinstance(task.get('taskId', task.get('task_id')), str):
+                            incomplete = True
+                            continue
+                        if task.get('detached', True) is not False and task.get('status') in ('running', 'awaiting_approval'):
+                            running += 1
+                    except (OSError, ValueError):
+                        incomplete = True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            incomplete = True
+        return True
+
+    try:
+        with os.scandir(os.path.join(session_dir, 'agents')) as agents:
+            for agent in agents:
+                if time.monotonic() >= deadline:
+                    return {'running': running, 'incomplete': True}
+                if agent.is_dir(follow_symlinks=False) and not scan(os.path.join(agent.path, 'tasks'), agent.name):
+                    return {'running': running, 'incomplete': True}
+    except FileNotFoundError:
+        pass
+    except OSError:
+        incomplete = True
+    # 旧版主代理任务位于会话根目录。 / Older main-agent tasks live at the session root.
+    if not scan(os.path.join(session_dir, 'tasks'), 'main'):
+        incomplete = True
+    return {'running': running, 'incomplete': incomplete}
+
+
 def read_activity(home, session):
     """只读当前会话 512 KiB 尾部。 / Read only the selected session's last 512 KiB."""
     if not isinstance(session, str) or not re.fullmatch(r'session_[a-zA-Z0-9_-]+', session):
@@ -243,7 +312,11 @@ def read_activity(home, session):
             for workspace in workspaces:
                 if not workspace.is_dir(follow_symlinks=False):
                     continue
-                wire = os.path.join(workspace.path, session, 'agents', 'main', 'wire.jsonl')
+                session_dir = os.path.join(workspace.path, session)
+                if not os.path.isdir(session_dir) or os.path.islink(session_dir):
+                    continue
+                wire = os.path.join(session_dir, 'agents', 'main', 'wire.jsonl')
+                activity = {}
                 try:
                     with open(wire, 'rb') as f:
                         start = max(0, os.fstat(f.fileno()).st_size - MAX_TAIL_BYTES)
@@ -251,9 +324,11 @@ def read_activity(home, session):
                         text = f.read(MAX_TAIL_BYTES).decode('utf-8', errors='replace')
                     if start:
                         text = text[text.find('\n') + 1:]
-                    return parse_activity(text[:text.rfind('\n') + 1])
+                    activity = parse_activity(text[:text.rfind('\n') + 1])
                 except (OSError, TypeError, ValueError, KeyError, OverflowError):
-                    continue
+                    pass
+                activity['backgroundTasks'] = read_background_tasks(session_dir)
+                return activity
     except OSError:
         pass
     return {}

@@ -1,6 +1,6 @@
 # Kimi Code Monitor
 
-> **CLI HUD demo（Kimi Code 2.2.0+）**：通过官方状态栏接口，在终端内显示模型、工具状态和 Kimi 账户额度，可选 token 明细。支持本机安装与恢复，见 [CLI HUD 试用说明](docs/CLI-HUD.md)。
+> **CLI HUD demo（Kimi Code 2.2.0+）**：通过官方状态栏接口，在终端内显示模型、工具状态、后台运行任务数和 Kimi 账户额度，可选 token 明细。支持本机安装与恢复，见 [CLI HUD 试用说明](docs/CLI-HUD.md)。
 
 <p align="center"><strong>简体中文 | <a href="README.en.md">English</a></strong></p>
 
